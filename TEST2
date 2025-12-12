@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Optimized Live obstacle detection with depth and Arduino brake control
+using YOLOv8 + MiDaS.
+High-performance version with GPU acceleration and optimizations.
+@author: aev (optimized)
+"""
+
+import cv2
+import torch
+import time
+import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+import os
+from threading import Thread
+import queue
+import serial # Added for Arduino communication
+
+# --- Calibration & Control Constants ---
+
+# -- Arduino Communication --
+# MODIFIED FOR WINDOWS: Changed default port to 'COM3'.
+# IMPORTANT: Check Windows Device Manager under "Ports (COM & LPT)" to find your Arduino's
+#            actual COM port and change it here if necessary.
+ARDUINO_PORT = 'COM10'
+BAUD_RATE = 9600
+
+# -- Braking Logic --
+# Brakes will be applied if an object is detected closer than this distance in meters.
+DANGER_ZONE_METERS = 7.5
+
+# -- Depth Estimation Calibration --
+# IMPORTANT: You MUST calibrate these values for your specific camera and setup for accurate distance measurement.
+# Adjust DEPTH_SCALE_FACTOR to stretch or shrink the calculated distance.
+# A larger value means objects will appear further away.
+DEPTH_SCALE_FACTOR = 10.0
+# Adjust DEPTH_OFFSET to add or subtract a fixed distance (in meters).
+DEPTH_OFFSET = 0.0
+
+
+# --- Initialize Serial Communication with Arduino ---
+ser = None
+try:
+    ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2) # Wait for the connection to establish
+    print(f"✅ Successfully connected to Arduino on {ARDUINO_PORT}")
+except serial.SerialException as e:
+    print(f"❌ Failed to connect to Arduino on {ARDUINO_PORT}. Error: {e}")
+    print("Running in detection-only mode.")
+    ser = None
+
+# -------------- Argument Parser ------------------
+parser = argparse.ArgumentParser(description="Live Obstacle Detection with Depth and Brake Control")
+parser.add_argument('--source', type=str, default='0',
+                    help="Video file path, webcam index (0, 1...) or /dev/videoX")
+parser.add_argument('--save-video', action='store_true', help="Save output video")
+parser.add_argument('--depth-freq', type=int, default=5, help="Process depth every N frames")
+parser.add_argument('--resolution', type=str, default='640x360', help="Resolution WxH")
+args = parser.parse_args()
+
+# Parse resolution
+width, height = map(int, args.resolution.split('x'))
+
+# ------------ Helper Functions -------------------
+def is_valid_video_file(path):
+    return os.path.isfile(path) and path.lower().endswith(('.mp4', '.avi', '.mov'))
+
+def auto_select_camera(preferred='0', fallback_max_index=3):
+    try:
+        preferred_idx = int(preferred)
+        cap_check = cv2.VideoCapture(preferred_idx)
+        if cap_check.isOpened():
+            print(f"✅ Using preferred camera index: {preferred_idx}")
+            cap_check.release()
+            return preferred_idx
+    except ValueError:
+        pass # Not a digit, will be handled later
+
+    print(f"⚠️ Preferred camera '{preferred}' not found or failed to open. Trying fallback...")
+    for i in range(fallback_max_index, -1, -1):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            cap.release()
+            print(f"✅ Found fallback webcam at index: {i}")
+            return i
+    print("❌ No available webcam found.")
+    return None
+
+# ------------ Resolve Video Source ----------------
+source_arg = args.source.strip()
+source = None
+
+if source_arg.isdigit():
+    source = int(source_arg)
+elif source_arg.startswith("/dev/video") and os.path.exists(source_arg):
+    source = source_arg
+elif is_valid_video_file(source_arg):
+    source = source_arg
+else:
+    print(f"⚠️ Invalid or missing source '{source_arg}'. Attempting auto-select...")
+    source = auto_select_camera()
+    if source is None:
+        exit()
+
+# ------------ Initialize Video Capture ------------
+cap = cv2.VideoCapture(source)
+if not cap.isOpened():
+    print(f"❌ Failed to open video source: {source}")
+    exit()
+
+# Optimize capture settings
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to prevent lag
+
+print(f"📹 Using video source: {source} at {width}x{height}")
+
+# ------------ Device Selection -------------------
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"🖥️  Using device: {device}")
+
+# ------------ MiDaS Depth Estimation (Optimized) --
+model_type = "MiDaS_small"
+print("🔄 Loading MiDaS model...")
+midas = torch.hub.load("intel-isl/MiDaS", model_type, trust_repo=True)
+midas.to(device).eval()
+
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+transform = midas_transforms.small_transform
+
+# ------------ YOLOv8 Model ------------------------
+print("🔄 Loading YOLO model...")
+model = YOLO("yolov8n.pt")
+model.to(device)
+
+# ------------ Video Output Settings ---------------
+out = None
+if args.save_video:
+    fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+    out = cv2.VideoWriter('output_video.mp4',
+                          cv2.VideoWriter_fourcc(*'mp4v'),
+                          fps, (width, height))
+
+# ------------ Optimized Picture-in-Picture ----------
+def fast_picture_in_picture(main, overlay, scale=0.25, margin=10):
+    h, w = main.shape[:2]
+    oh, ow = overlay.shape[:2]
+    new_h = int(h * scale)
+    new_w = int(ow * new_h / oh)
+    small_overlay = cv2.resize(overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    x_offset = w - new_w - margin
+    y_offset = margin
+    main[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = small_overlay
+    return main
+
+# ------------ Threaded Frame Reading ---------------
+class FrameReader:
+    def __init__(self, cap):
+        self.cap = cap
+        self.q = queue.Queue(maxsize=2)
+        self.running = True
+        self.thread = Thread(target=self.update, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def update(self):
+        while self.running:
+            if not self.cap.isOpened():
+                self.running = False
+                break
+            ret, frame = self.cap.read()
+            if not ret:
+                self.running = False
+                break
+            if not self.q.full():
+                self.q.put(frame)
+            else:
+                self.q.get() # Discard oldest frame to make room for the new one
+                self.q.put(frame)
+
+    def read(self):
+        try:
+            return self.q.get(timeout=1) # Timeout to prevent indefinite blocking
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join()
+
+# ------------ Initialize Frame Reader -------------
+frame_reader = FrameReader(cap)
+frame_reader.start()
+
+# ------------ Performance Tracking & Display ------
+frame_count = 0
+start_time = time.time()
+fps_counter = 0
+current_fps = 0
+depth_cache = None
+plasma_colormap = plt.cm.plasma(np.linspace(0, 1, 256))[:, :3]
+brake_applied = False
+show_depth = True
+
+print("🚀 Starting optimized obstacle detection...")
+print(f"📊 Depth processing every {args.depth_freq} frames")
+print(f" braking distance set to < {DANGER_ZONE_METERS}m")
+print("Press 'q' to quit, 's' to toggle depth display")
+
+try:
+    while frame_reader.running:
+        frame = frame_reader.read()
+        if frame is None:
+            print("Camera feed stopped.")
+            break
+
+        frame_count += 1
+
+        # ----- Object Detection (every frame) -----
+        results = model.predict(frame, verbose=False, conf=0.5, device=device)
+
+        # ----- Depth Estimation (every N frames) -----
+        if frame_count % args.depth_freq == 0:
+            with torch.no_grad():
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                input_batch = transform(img_rgb).to(device)
+
+                with torch.cuda.amp.autocast(enabled=(device == 'cuda')):
+                    prediction = midas(input_batch)
+                    prediction = torch.nn.functional.interpolate(
+                        prediction.unsqueeze(1),
+                        size=(height, width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze()
+
+                depth_map = prediction.cpu().numpy()
+                # Normalize for visualization
+                depth_map_viz = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+                depth_cache = depth_map_viz
+
+        # ----- Draw Detections & Check for Obstacles -----
+        annotated_frame = frame.copy()
+        obstacle_in_danger_zone = False
+
+        for result in results:
+            if result.boxes is None: continue
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = box.conf[0]
+                cls = int(box.cls[0])
+                class_name = result.names[cls]
+
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                distance_text = ""
+                if depth_cache is not None:
+                    center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                    
+                    # Sample a small region around the center for more stable depth reading
+                    h_margin = max(1, (y2 - y1) // 8)
+                    w_margin = max(1, (x2 - x1) // 8)
+                    
+                    depth_region = depth_cache[
+                        max(0, center_y - h_margin):min(height, center_y + h_margin),
+                        max(0, center_x - w_margin):min(width, center_x + w_margin)
+                    ]
+
+                    if depth_region.size > 0:
+                        # MiDaS outputs inverse depth. Higher value = closer.
+                        relative_depth = np.median(depth_region)
+                        
+                        # Apply calibration to estimate distance in meters
+                        distance = (1.0 - relative_depth) * DEPTH_SCALE_FACTOR + DEPTH_OFFSET
+                        distance_text = f" | {distance:.1f}m"
+
+                        if 0 < distance < DANGER_ZONE_METERS:
+                            obstacle_in_danger_zone = True
+                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 2) # Highlight danger object
+
+                label = f"{class_name} {conf:.2f}{distance_text}"
+                cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # ----- Send Commands to Arduino -----
+        if ser is not None:
+            if obstacle_in_danger_zone and not brake_applied:
+                ser.write(b'B') # Send 'B' to apply brake
+                brake_applied = True
+                print("BRAKE APPLIED!")
+            elif not obstacle_in_danger_zone and brake_applied:
+                ser.write(b'R') # Send 'R' to release brake
+                brake_applied = False
+                print("Brake Released.")
+
+        # ----- Add Depth Overlay -----
+        if show_depth and depth_cache is not None:
+            depth_indices = (depth_cache * 255).astype(np.uint8)
+            depth_colored = (plasma_colormap[depth_indices][..., ::-1] * 255).astype(np.uint8) # BGR
+            annotated_frame = fast_picture_in_picture(annotated_frame, depth_colored)
+
+        # ----- FPS Calculation & Display -----
+        fps_counter += 1
+        if (time.time() - start_time) > 1:
+            current_fps = fps_counter / (time.time() - start_time)
+            fps_counter = 0
+            start_time = time.time()
+        
+        cv2.putText(annotated_frame, f'FPS: {current_fps:.1f}', (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        brake_status_text = "BRAKE ON" if brake_applied else "BRAKE OFF"
+        brake_color = (0, 0, 255) if brake_applied else (0, 255, 0)
+        cv2.putText(annotated_frame, brake_status_text, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, brake_color, 2)
+
+        # ----- Show Frame & Handle Keys -----
+        cv2.imshow('Optimized Obstacle Detection', annotated_frame)
+        if out is not None: out.write(annotated_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('s'): show_depth = not show_depth
+
+except KeyboardInterrupt:
+    print("\n🛑 Interrupted by user")
+finally:
+    print("🧹 Cleaning up...")
+    if ser is not None:
+        ser.write(b'R') # Ensure brake is released on exit
+        ser.close()
+    frame_reader.stop()
+    cap.release()
+    if out is not None: out.release()
+    cv2.destroyAllWindows()
+    print("✅ Cleanup complete")
