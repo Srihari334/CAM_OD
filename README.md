@@ -64,6 +64,16 @@ python3 TEST1.py
 python TEST2.py
 ```
 
+## Telugu Calendar App
+
+An interactive Telugu calendar app is included as a standalone script.
+
+```bash
+python3 telugu_calendar_app.py
+```
+
+> Note: This app uses Python's built-in Tkinter GUI toolkit.
+
 ### Command-line Options
 
 - `--source`: Video source (default: '0' for webcam, or video file path)
