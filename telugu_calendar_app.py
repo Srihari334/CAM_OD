@@ -130,7 +130,6 @@ class TeluguCalendarApp:
                     self.grid_frame,
                     text=str(day),
                     width=4,
-                    command=lambda d=day, b=None: None,
                 )
                 button.grid(row=row_index, column=col_index, padx=2, pady=2)
 
